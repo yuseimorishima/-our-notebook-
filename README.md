@@ -40,6 +40,8 @@ NOTEBOOK_TEST_URL=http://127.0.0.1:3102 npm test
 
 ## 公開時の設定
 
+Render向けの永続ディスク付き公開設定を `render.yaml` に用意しています。手順と料金に関する注意は [公開手順](docs/deploy.md) を参照してください。GitHubへの保存だけではサイトは公開されません。
+
 | 環境変数 | 用途 | 既定値 |
 | --- | --- | --- |
 | `NOTEBOOK_DB_PATH` | SQLiteファイルのパス | `data/notebook.sqlite` |

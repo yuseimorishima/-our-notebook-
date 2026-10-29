@@ -1,0 +1,25 @@
+# Opt-in deployment: this creates a PAID web service and persistent disk.
+# Review Render's current prices before clicking Apply/Create Resources.
+services:
+  - type: web
+    name: our-notebook
+    runtime: node
+    plan: starter
+    region: singapore
+    numInstances: 1
+    buildCommand: npm ci --include=dev --no-audit --no-fund && npm run build
+    startCommand: APP_ORIGIN="$RENDER_EXTERNAL_URL" npm start
+    healthCheckPath: /api/auth/me
+    disk:
+      name: notebook-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 24.19.0
+      - key: NODE_ENV
+        value: production
+      - key: NOTEBOOK_COOKIE_SECURE
+        value: "true"
+      - key: NOTEBOOK_DB_PATH
+        value: /var/data/notebook.sqlite
