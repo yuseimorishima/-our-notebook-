@@ -7,6 +7,7 @@ export const config = { api: { bodyParser: { sizeLimit: '256kb' } } };
 const cookieName = 'notebook_session';
 const duration = 7 * 24 * 60 * 60;
 const digest = (token: string) => createHash('sha256').update(token).digest('hex');
+const isAdmin = (id: number) => String(id) === process.env.ADMIN_USER_ID;
 const dummyHash = bcrypt.hashSync('dummy-password-for-timing', 12);
 class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -16,16 +17,20 @@ function setSession(res: NextApiResponse, token: string, age = duration) {
   const secure = process.env.NOTEBOOK_COOKIE_SECURE === 'true' || (process.env.NOTEBOOK_COOKIE_SECURE !== 'false' && process.env.NODE_ENV === 'production');
   res.setHeader('Set-Cookie', `${cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${age}${secure ? '; Secure' : ''}`);
 }
-function getUser(req: NextApiRequest): User | undefined {
+async function getUser(req: NextApiRequest): Promise<User | undefined> {
   const token = req.cookies[cookieName];
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return;
-  return db.prepare(`SELECT users.id, users.username FROM sessions JOIN users ON users.id = sessions.user_id WHERE token_hash = ? AND expires_at > ?`).get(digest(token), Date.now()) as User | undefined;
+  const row = await db.prepare(`SELECT users.id, users.username FROM sessions JOIN users ON users.id = sessions.user_id WHERE token_hash = ? AND expires_at > ? AND users.disabled = 0`).get(digest(token), Date.now()) as User | undefined;
+  return row ? { ...row, is_admin: isAdmin(row.id) } : undefined;
 }
-function throttle(key: string) {
+async function throttle(key: string) {
   const now = Date.now();
-  db.prepare('DELETE FROM attempts WHERE reset_at < ?').run(now);
-  db.prepare('INSERT INTO attempts VALUES (?, 1, ?) ON CONFLICT(key) DO UPDATE SET count = count + 1').run(key, now + 15 * 60 * 1000);
-  const row = db.prepare('SELECT count FROM attempts WHERE key = ?').get(key) as { count: number };
+  await db.prepare('DELETE FROM attempts WHERE reset_at < ?').run(now - 24 * 60 * 60 * 1000);
+  const row = await db.prepare(`INSERT INTO attempts VALUES (?, 1, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      count = CASE WHEN attempts.reset_at <= ? THEN 1 ELSE attempts.count + 1 END,
+      reset_at = CASE WHEN attempts.reset_at <= ? THEN excluded.reset_at ELSE attempts.reset_at END
+    RETURNING count`).get(key, now + 15 * 60 * 1000, now, now) as { count: number };
   if (row.count > 10) fail(429, '試行回数が多すぎます。15分ほど待ってからお試しください。');
 }
 function inputNote(body: Record<string, unknown>) {
@@ -48,64 +53,97 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
-    if (path === 'auth/me' && method === 'GET') return res.json({ user: getUser(req) || null });
+    if (path === 'auth/me' && method === 'GET') {
+      await db.ready();
+      return res.json({ user: (await getUser(req)) || null });
+    }
     if (['auth/register', 'auth/login'].includes(path) && method === 'POST') {
       const username = typeof body.username === 'string' ? body.username.normalize('NFKC').trim().toLowerCase() : '';
       if (!/^[\p{L}\p{N}_-]{3,30}$/u.test(username)) fail(400, 'ユーザー名は文字・数字・_・-を使い、3〜30文字にしてください。');
       if (typeof body.password !== 'string' || body.password.length < 10 || Buffer.byteLength(body.password, 'utf8') > 72) fail(400, 'パスワードは10文字以上、UTF-8で72バイト以内にしてください。');
-      throttle(`auth:${req.socket.remoteAddress || 'local'}:${username}`);
+      await throttle(`auth:${req.socket.remoteAddress || 'local'}:${username}`);
       if (path === 'auth/register') {
-        throttle(`register:${req.socket.remoteAddress || 'local'}`);
+        await throttle(`register:${req.socket.remoteAddress || 'local'}`);
         const hash = await bcrypt.hash(body.password, 12);
-        try { db.prepare('INSERT INTO users(username, password_hash) VALUES (?, ?)').run(username, hash); }
+        try { await db.prepare('INSERT INTO users(username, password_hash) VALUES (?, ?)').run(username, hash); }
         catch (e) {
-          if ((e as {code?: string}).code === 'SQLITE_CONSTRAINT_UNIQUE') fail(409, 'このユーザー名はすでに使われています。');
+          const constraint = e as { code?: string; rawCode?: number; message?: string };
+          if (constraint.code === 'SQLITE_CONSTRAINT_UNIQUE' || (constraint.code === 'SQLITE_CONSTRAINT' && (constraint.rawCode === 2067 || constraint.message?.includes('UNIQUE constraint failed: users.username')))) fail(409, 'このユーザー名はすでに使われています。');
           throw e;
         }
       }
-      const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username) as (User & { password_hash: string }) | undefined;
+      const row = await db.prepare('SELECT * FROM users WHERE username = ?').get(username) as (User & { password_hash: string; disabled: number }) | undefined;
       const valid = await bcrypt.compare(body.password, row?.password_hash || dummyHash);
-      if (!row || !valid) fail(401, 'ユーザー名またはパスワードが違います。');
-      db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
-      if (req.cookies[cookieName]) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest(req.cookies[cookieName]));
+      if (!row || !valid || row.disabled) fail(401, 'ユーザー名またはパスワードが違います。');
+      await db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
+      if (req.cookies[cookieName]) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest(req.cookies[cookieName]));
       const token = randomBytes(32).toString('hex');
-      db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(digest(token), row.id, Date.now() + duration * 1000);
+      await db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(digest(token), row.id, Date.now() + duration * 1000);
       setSession(res, token);
-      return res.status(path === 'auth/register' ? 201 : 200).json({ user: { id: row.id, username: row.username } });
+      return res.status(path === 'auth/register' ? 201 : 200).json({ user: { id: row.id, username: row.username, is_admin: isAdmin(row.id) } });
     }
-    const user = getUser(req);
+    const user = await getUser(req);
     if (!user) fail(401, 'ログインしてください。');
+    if (path.startsWith('admin/')) {
+      if (!user.is_admin) fail(403, '管理者だけが操作できます。');
+      if (path === 'admin/users' && method === 'GET') {
+        const users = await db.prepare(`SELECT users.id, users.username, users.disabled,
+          (SELECT count(*) FROM notes WHERE owner_id = users.id AND visibility = 'shared') AS shared_count
+          FROM users ORDER BY users.id`).all();
+        return res.json({ users, shared: await db.prepare(`${noteQuery} WHERE visibility = 'shared' ORDER BY notes.id DESC`).all() });
+      }
+      if (/^admin\/users\/\d+$/.test(path) && method === 'PUT') {
+        const id = Number(path.split('/')[2]);
+        if (id === user.id) fail(400, '自分自身を利用停止にはできません。');
+        if (typeof body.disabled !== 'boolean') fail(400, '利用状態が正しくありません。');
+        if (!await db.prepare('SELECT id FROM users WHERE id = ?').get(id)) fail(404, 'ユーザーが見つかりません。');
+        await db.batch([
+          { sql: 'UPDATE users SET disabled = ? WHERE id = ?', args: [body.disabled ? 1 : 0, id] },
+          { sql: 'DELETE FROM sessions WHERE user_id = ?', args: [id] }
+        ]);
+        return res.json({ ok: true });
+      }
+      if (/^admin\/notes\/\d+$/.test(path) && method === 'DELETE') {
+        const id = Number(path.split('/')[2]);
+        const note = await db.prepare("SELECT id, revision FROM notes WHERE id = ? AND visibility = 'shared'").get(id) as { id: number; revision: number } | undefined;
+        if (!note) fail(404, '共有ノートが見つかりません。');
+        const result = await db.prepare("DELETE FROM notes WHERE id = ? AND revision = ? AND visibility = 'shared'").run(id, Number(req.query.revision));
+        if (!result.changes) fail(409, 'ノートが変更されています。再読み込みしてください。');
+        return res.json({ ok: true });
+      }
+      fail(404, 'この管理操作は見つかりません。');
+    }
     if (path === 'auth/logout' && method === 'POST') {
-      db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest(req.cookies[cookieName]!));
+      await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest(req.cookies[cookieName]!));
       setSession(res, '', 0);
       return res.json({ ok: true });
     }
     if (path === 'notes' && method === 'GET') {
-      const notes = db.prepare(`${noteQuery} WHERE owner_id = ? OR visibility = 'shared' ORDER BY updated_at DESC, notes.id DESC`).all(user.id);
+      const notes = await db.prepare(`${noteQuery} WHERE owner_id = ? OR visibility = 'shared' ORDER BY updated_at DESC, notes.id DESC`).all(user.id);
       return res.json({ notes });
     }
     if (path === 'notes' && method === 'POST') {
       const note = inputNote(body);
       const now = new Date().toISOString();
-      const result = db.prepare('INSERT INTO notes(owner_id, title, body, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(user.id, note.title, note.body, note.visibility, now, now);
-      return res.status(201).json({ note: db.prepare(`${noteQuery} WHERE notes.id = ?`).get(result.lastInsertRowid) });
+      const result = await db.prepare('INSERT INTO notes(owner_id, title, body, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(user.id, note.title, note.body, note.visibility, now, now);
+      return res.status(201).json({ note: await db.prepare(`${noteQuery} WHERE notes.id = ?`).get(result.lastInsertRowid) });
     }
     if (/^notes\/\d+$/.test(path)) {
       const id = Number(path.split('/')[1]);
-      const note = db.prepare(`${noteQuery} WHERE notes.id = ? AND (owner_id = ? OR visibility = 'shared')`).get(id, user.id) as Note | undefined;
+      const note = await db.prepare(`${noteQuery} WHERE notes.id = ? AND (owner_id = ? OR visibility = 'shared')`).get(id, user.id) as Note | undefined;
       if (!note) fail(404, 'ノートが見つかりません。');
       if (method === 'GET') return res.json({ note });
       if (method === 'PUT') {
         const value = inputNote(body);
         if (note.owner_id !== user.id && value.visibility !== note.visibility) fail(403, '公開範囲を変更できるのは作成者だけです。');
         if (!Number.isInteger(body.revision)) fail(400, 'ノートのバージョンが必要です。');
-        const result = db.prepare('UPDATE notes SET title = ?, body = ?, visibility = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?').run(value.title, value.body, value.visibility, new Date().toISOString(), id, body.revision);
+        const result = await db.prepare('UPDATE notes SET title = ?, body = ?, visibility = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?').run(value.title, value.body, value.visibility, new Date().toISOString(), id, body.revision);
         if (!result.changes) fail(409, '他の人が更新しました。再読み込みして最新の内容を確認してください。入力内容はそのまま残っています。');
-        return res.json({ note: db.prepare(`${noteQuery} WHERE notes.id = ?`).get(id) });
+        return res.json({ note: await db.prepare(`${noteQuery} WHERE notes.id = ?`).get(id) });
       }
       if (method === 'DELETE') {
         if (note.owner_id !== user.id) fail(403, '削除できるのは作成者だけです。');
-        const result = db.prepare('DELETE FROM notes WHERE id = ? AND revision = ?').run(id, Number(req.query.revision));
+        const result = await db.prepare('DELETE FROM notes WHERE id = ? AND revision = ?').run(id, Number(req.query.revision));
         if (!result.changes) fail(409, 'ノートが更新されています。再読み込みしてください。');
         return res.json({ ok: true });
       }

@@ -67,6 +67,31 @@ test('multi-user notebook API', async t => {
     assert.equal((await a.call('notes','POST',{}, {Origin:'https://untrusted.example'})).status,403);
     for(const body of [{title:'',body:'',visibility:'private'},{title:'test',body:'',visibility:'invalid'},{title:'test',body:'x'.repeat(100001),visibility:'private'}]) assert.equal((await a.call('notes','POST',body)).status,400);
   });
+  await t.test('admin access, user suspension and shared moderation',async()=>{
+    assert.equal((await a.call('auth/me')).data.user.is_admin,true);
+    assert.equal((await b.call('auth/me')).data.user.is_admin,false);
+    assert.equal((await guest.call('admin/users')).status,401);
+    assert.equal((await b.call('admin/users')).status,403);
+    assert.equal((await b.call('admin/users/1','PUT',{disabled:true})).status,403);
+    const overview=await a.call('admin/users');
+    assert.equal(overview.status,200);
+    assert(!JSON.stringify(overview.data).includes('password_hash'));
+    assert(!JSON.stringify(overview.data).includes('秘密の学習記録'));
+    const peer=overview.data.users.find(u=>u.username===`peer_${suffix}`);
+    const adminId=(await a.call('auth/me')).data.user.id;
+    assert.equal((await a.call(`admin/users/${adminId}`,'PUT',{disabled:true})).status,400);
+    assert.equal((await a.call(`admin/users/${peer.id}`,'PUT',{disabled:true})).status,200);
+    assert.equal((await b.call('notes')).status,401);
+    assert.equal((await b.call('auth/login','POST',{...creds,username:peer.username})).status,401);
+    assert.equal((await a.call(`admin/users/${peer.id}`,'PUT',{disabled:false})).status,200);
+    assert.equal((await b.call('notes')).status,401);
+    assert.equal((await b.call('auth/login','POST',{...creds,username:peer.username})).status,200);
+    const note=(await b.call('notes','POST',{title:'moderation',body:'shared',visibility:'shared'})).data.note;
+    assert.equal((await a.call(`admin/notes/${note.id}?revision=0`,'DELETE')).status,409);
+    assert.equal((await a.call(`admin/notes/${personal.id}?revision=1`,'DELETE')).status,404);
+    assert.equal((await a.call(`admin/notes/${note.id}?revision=1`,'DELETE')).status,200);
+    assert.equal((await b.call(`notes/${note.id}`)).status,404);
+  });
   await t.test('owner deletion and logout invalidate access',async()=>{
     assert.equal((await a.call(`notes/${personal.id}?revision=1`,'DELETE')).status,200);
     assert.equal((await a.call(`notes/${personal.id}`)).status,404);
