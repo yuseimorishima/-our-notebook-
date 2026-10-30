@@ -47,6 +47,23 @@ export default function Home() {
     setSelected(note); setTitle(note?.title || ''); setBody(note?.body || '');
     setVisibility(note?.visibility || tab); setEditing(true); setError(''); setNotice('');
   }
+  function useTemplate(kind: 'study' | 'question' | 'idea') {
+    if ((title || body) && !window.confirm('入力中の内容をテンプレートに置き換えますか？')) return;
+    const templates = {
+      study: { title: '今日の学習ノート', body: '【今日のテーマ】\n\n\n【学んだこと】\n\n\n【大事なポイント】\n\n\n【次にやること】\n' },
+      question: { title: 'わからないことメモ', body: '【知りたいこと】\n\n\n【今わかっていること】\n\n\n【調べたこと・答え】\n\n\n【次に試すこと】\n' },
+      idea: { title: 'みんなのアイデア', body: '【テーマ】\n\n\n【アイデア】\n\n\n【話し合いたいこと】\n\n\n【次の一歩】\n' }
+    };
+    setTitle(templates[kind].title); setBody(templates[kind].body); setNotice('テンプレートを入れました。自由に書き換えられます。'); setError('');
+  }
+  function downloadNote() {
+    const filename = (title.trim() || 'ノート').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 100);
+    const url = URL.createObjectURL(new Blob([`${title.trim() || '無題'}\n\n${body}`], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a'); link.href = url; link.download = `${filename}.txt`;
+    document.body.appendChild(link); link.click(); link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setNotice('表示中の内容をテキストファイルに書き出しました。');
+  }
   async function authenticate(e: FormEvent<HTMLFormElement>) {
     e.preventDefault(); setBusy(true); setError('');
     const data = new FormData(e.currentTarget);
@@ -121,7 +138,8 @@ export default function Home() {
         <div className="notebook-grid"><section className="note-list" aria-label="ノート一覧"><label className="search"><span className="sr-only">ノートを検索</span><input value={search} onChange={e => setSearch(e.target.value)} placeholder="タイトル・本文を検索…" /></label><span className="count">{visible.length} 件のノート</span>
           {visible.length === 0 ? <div className="list-empty">{search ? '一致するノートはありません。' : 'まだノートがありません。最初の1ページを書いてみましょう。'}</div> : visible.map(note => <button disabled={busy} className={`note-card ${selected?.id === note.id ? 'selected' : ''}`} key={note.id} onClick={() => open(note)}><span className="note-date">{date(note.updated_at)}</span><h3>{note.title}</h3><p>{note.body || '本文はまだありません。'}</p><span className="note-author">{note.visibility === 'private' ? '自分だけ' : `作成：${note.username}`}</span></button>)}
         </section>
-        <section className="editor" aria-label="ノート編集">{!editing ? <div className="empty-editor"><span className="paper-icon">▤</span><h3>ここから、次の発見を。</h3><p>ノートを選んで続きを書くか、<br />新しいノートを作ってみましょう。</p><button className="secondary" disabled={busy} onClick={() => open(null)}>＋ ノートを作成</button></div> : <form onSubmit={save}><div className="editor-toolbar"><span className="eyebrow">{selected ? 'NOTEBOOK' : 'NEW NOTEBOOK'} {dirty && '・未保存'}</span><div><button className="primary" disabled={busy}>{busy ? '処理中…' : '保存する'}</button></div></div>
+        <section className="editor" aria-label="ノート編集">{!editing ? <div className="empty-editor"><span className="paper-icon">▤</span><h3>ここから、次の発見を。</h3><p>ノートを選んで続きを書くか、<br />新しいノートを作ってみましょう。</p><button className="secondary" disabled={busy} onClick={() => open(null)}>＋ ノートを作成</button></div> : <form onSubmit={save} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (!busy) event.currentTarget.requestSubmit(); } }}><div className="editor-toolbar"><span className="eyebrow">{selected ? 'NOTEBOOK' : 'NEW NOTEBOOK'} {dirty && '・未保存'}</span><div className="editor-actions"><button type="button" className="secondary" onClick={downloadNote} disabled={busy}>書き出す</button><button className="primary" disabled={busy}>{busy ? '処理中…' : '保存する'}</button></div></div>
+          {!selected && <div className="templates"><span>書き始めに迷ったら</span><div><button type="button" disabled={busy} onClick={() => useTemplate('study')}>✦ 学習メモ</button><button type="button" disabled={busy} onClick={() => useTemplate('question')}>？ 疑問メモ</button><button type="button" disabled={busy} onClick={() => useTemplate('idea')}>＋ アイデア</button></div></div>}
           <label className="sr-only" htmlFor="note-title">タイトル</label><input id="note-title" className="title-input" value={title} onChange={e => setTitle(e.target.value)} maxLength={120} placeholder="ノートのタイトル" required disabled={busy} />
           <div className="note-meta"><label>公開範囲 <select value={visibility} onChange={e => setVisibility(e.target.value as 'private' | 'shared')} disabled={busy || (!!selected && selected.owner_id !== user.id)}><option value="private">自分だけ</option><option value="shared">みんなに共有</option></select></label>{selected && <small>作成：{selected.username}</small>}</div>
           <label className="sr-only" htmlFor="note-body">本文</label><textarea id="note-body" value={body} onChange={e => setBody(e.target.value)} maxLength={100000} placeholder="今日学んだこと、気づいたことを書いてみましょう…" disabled={busy} />
