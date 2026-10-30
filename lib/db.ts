@@ -74,6 +74,11 @@ const schema = `
     title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', visibility TEXT NOT NULL CHECK(visibility IN ('private', 'shared')),
     revision INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS note_shares (
+    note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (note_id, user_id)
+  );
   CREATE TABLE IF NOT EXISTS attempts (key TEXT PRIMARY KEY, count INTEGER NOT NULL, reset_at INTEGER NOT NULL);
   CREATE INDEX IF NOT EXISTS notes_owner ON notes(owner_id);
 `;

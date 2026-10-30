@@ -2,7 +2,7 @@ import Head from 'next/head';
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import type { Note, User } from '../lib/db';
 
-type Reply = { user: User | null; notes: Note[]; note: Note };
+type Reply = { user: User | null; notes: Note[]; note: Note; usernames: string[] };
 async function api(path: string, method = 'GET', body?: unknown): Promise<Reply> {
   const res = await fetch(`/api/${path}`, {
     method, headers: { 'Content-Type': 'application/json', 'X-Notebook-Request': '1' },
@@ -28,6 +28,8 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [shareNames, setShareNames] = useState('');
+  const [shareLoaded, setShareLoaded] = useState(false);
   const dirty = editing && (selected ? title !== selected.title || body !== selected.body || visibility !== selected.visibility : !!title || !!body);
   useEffect(() => {
     api('auth/me').then(async data => {
@@ -40,7 +42,23 @@ export default function Home() {
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
   }, [dirty]);
-  const visible = useMemo(() => notes.filter(note => note.visibility === tab && `${note.title}\n${note.body}`.toLowerCase().includes(search.toLowerCase())), [notes, tab, search]);
+  useEffect(() => {
+    let active = true;
+    setShareNames(''); setShareLoaded(false);
+    if (selected && user && selected.owner_id === user.id && selected.visibility === 'private') {
+      api(`notes/${selected.id}/shares`).then(result => { if (active) { setShareNames(result.usernames.join(', ')); setShareLoaded(true); } }).catch(error => { if (active) setError(error.message); });
+    }
+    return () => { active = false; };
+  }, [selected?.id, selected?.visibility, selected?.owner_id, user?.id]);
+  async function updateShares() {
+    if (!selected || !shareLoaded) return;
+    const usernames = shareNames.split(/[,、\n]/).map(name => name.trim()).filter(Boolean);
+    setBusy(true); setError(''); setNotice('');
+    try { const result = await api(`notes/${selected.id}/shares`, 'PUT', { usernames }); setShareNames(result.usernames.join(', ')); setNotice(usernames.length ? '指定したユーザーと共有しました。' : '指定したユーザーとの共有を解除しました。'); }
+    catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  }
+  const visible = useMemo(() => notes.filter(note => (note.visibility === 'shared' || note.owner_id !== user?.id ? 'shared' : 'private') === tab && `${note.title}\n${note.body}`.toLowerCase().includes(search.toLowerCase())), [notes, tab, search, user?.id]);
   function mayLeave() { return !dirty || window.confirm('保存していない変更があります。変更を破棄しますか？'); }
   function open(note: Note | null) {
     if (!mayLeave()) return;
@@ -79,7 +97,7 @@ export default function Home() {
     setBusy(true); setError(''); setNotice('');
     try {
       const { note } = await api(selected ? `notes/${selected.id}` : 'notes', selected ? 'PUT' : 'POST', { title, body, visibility, revision: selected?.revision });
-      setSelected(note); setTitle(note.title); setBody(note.body); setVisibility(note.visibility); setTab(note.visibility);
+      setSelected(note); setTitle(note.title); setBody(note.body); setVisibility(note.visibility); setTab(note.visibility === 'private' && note.owner_id !== user?.id ? 'shared' : note.visibility);
       setNotes(old => [note, ...old.filter(n => n.id !== note.id)]); setNotice('保存しました');
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
@@ -135,18 +153,19 @@ export default function Home() {
     </main> : <div className="workspace">
       <header className="topbar"><a href="/" onClick={e => { if (!mayLeave()) e.preventDefault(); }} className="brand">▤ <span>みんなのノート<small>OUR NOTEBOOK</small></span></a><div className="account"><span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span><span>{user.username}</span>{user.is_admin && <a className="text-button" href="/admin" onClick={e => { if (!mayLeave()) e.preventDefault(); }}>管理者ページ</a>}<button className="text-button" onClick={logout} disabled={busy}>ログアウト</button></div></header>
       <aside className="sidebar"><span className="eyebrow">YOUR LIBRARY</span><h1>学びの本棚</h1><button className="primary wide" disabled={busy} onClick={() => open(null)}>＋ 新しいノート</button>
-        <nav aria-label="ノートの種類">{(['private', 'shared'] as const).map(value => <button key={value} disabled={busy} className={`nav-item ${tab === value ? 'active' : ''}`} onClick={() => { if (!mayLeave()) return; setTab(value); setSelected(null); setEditing(false); setError(''); setNotice(''); }}><span>{value === 'private' ? '▧ 自分の学習ノート' : '▦ みんなの共有ノート'}</span><span>{notes.filter(n => n.visibility === value).length}</span></button>)}</nav>
-        <div className="sidebar-tip"><span>✦ 少しずつ、積み重ねる。</span><p>気づいたこと、わからないこと。<br />まずは言葉にしてみよう。</p></div><small className="privacy-note">個人ノートは自分だけ。<br />共有ノートは登録ユーザー全員が<br />閲覧・編集できます。</small>
+        <nav aria-label="ノートの種類">{(['private', 'shared'] as const).map(value => <button key={value} disabled={busy} className={`nav-item ${tab === value ? 'active' : ''}`} onClick={() => { if (!mayLeave()) return; setTab(value); setSelected(null); setEditing(false); setError(''); setNotice(''); }}><span>{value === 'private' ? '▧ 自分の学習ノート' : '▦ みんなの共有ノート'}</span><span>{notes.filter(n => (n.visibility === 'shared' || n.owner_id !== user.id ? 'shared' : 'private') === value).length}</span></button>)}</nav>
+        <div className="sidebar-tip"><span>✦ 少しずつ、積み重ねる。</span><p>気づいたこと、わからないこと。<br />まずは言葉にしてみよう。</p></div><small className="privacy-note">個人ノートは自分だけ。<br />ユーザー名を指定して共有できます。<br />全員に共有したノートは登録者全員が閲覧・編集できます。</small>
       </aside>
       <main className="desk"><div className="section-heading"><div><span className="eyebrow">{tab === 'private' ? 'MY STUDY NOTES' : 'SHARED WITH EVERYONE'}</span><h2>{tab === 'private' ? '自分の学習ノート' : 'みんなの共有ノート'}</h2><p>{tab === 'private' ? '自分のペースで、学びを残そう。' : 'アイデアを持ち寄って、一緒に育てよう。'}</p></div><button className="secondary" onClick={refresh} disabled={busy}>↻ 再読み込み</button></div>
         <div className="feedback" aria-live="polite">{error ? <p className="error" role="alert">{error}</p> : notice ? <p className="success">✓ {notice}</p> : <p>共有ノートの変更は「再読み込み」で確認できます。</p>}</div>
         <div className="notebook-grid"><section className="note-list" aria-label="ノート一覧"><label className="search"><span className="sr-only">ノートを検索</span><input value={search} onChange={e => setSearch(e.target.value)} placeholder="タイトル・本文を検索…" /></label><span className="count">{visible.length} 件のノート</span>
-          {visible.length === 0 ? <div className="list-empty">{search ? '一致するノートはありません。' : 'まだノートがありません。最初の1ページを書いてみましょう。'}</div> : visible.map(note => <button disabled={busy} className={`note-card ${selected?.id === note.id ? 'selected' : ''}`} key={note.id} onClick={() => open(note)}><span className="note-date">{date(note.updated_at)}</span><h3>{note.title}</h3><p>{note.body || '本文はまだありません。'}</p><span className="note-author">{note.visibility === 'private' ? '自分だけ' : `作成：${note.username}`}</span></button>)}
+          {visible.length === 0 ? <div className="list-empty">{search ? '一致するノートはありません。' : 'まだノートがありません。最初の1ページを書いてみましょう。'}</div> : visible.map(note => <button disabled={busy} className={`note-card ${selected?.id === note.id ? 'selected' : ''}`} key={note.id} onClick={() => open(note)}><span className="note-date">{date(note.updated_at)}</span><h3>{note.title}</h3><p>{note.body || '本文はまだありません。'}</p><span className="note-author">{note.visibility === 'private' && note.owner_id === user.id ? '自分のノート' : `作成：${note.username}`}</span></button>)}
         </section>
         <section className="editor" aria-label="ノート編集">{!editing ? <div className="empty-editor"><span className="paper-icon">▤</span><h3>ここから、次の発見を。</h3><p>ノートを選んで続きを書くか、<br />新しいノートを作ってみましょう。</p><button className="secondary" disabled={busy} onClick={() => open(null)}>＋ ノートを作成</button></div> : <form onSubmit={save} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (!busy) event.currentTarget.requestSubmit(); } }}><div className="editor-toolbar"><span className="eyebrow">{selected ? 'NOTEBOOK' : 'NEW NOTEBOOK'} {dirty && '・未保存'}</span><div className="editor-actions"><button type="button" className="secondary" onClick={downloadNote} disabled={busy}>書き出す</button><button className="primary" disabled={busy}>{busy ? '処理中…' : '保存する'}</button></div></div>
           {!selected && <div className="templates"><span>書き始めに迷ったら</span><div><button type="button" disabled={busy} onClick={() => useTemplate('study')}>✦ 学習メモ</button><button type="button" disabled={busy} onClick={() => useTemplate('question')}>？ 疑問メモ</button><button type="button" disabled={busy} onClick={() => useTemplate('idea')}>＋ アイデア</button></div></div>}
           <label className="sr-only" htmlFor="note-title">タイトル</label><input id="note-title" className="title-input" value={title} onChange={e => setTitle(e.target.value)} maxLength={120} placeholder="ノートのタイトル" required disabled={busy} />
-          <div className="note-meta"><label>公開範囲 <select value={visibility} onChange={e => setVisibility(e.target.value as 'private' | 'shared')} disabled={busy || (!!selected && selected.owner_id !== user.id)}><option value="private">自分だけ</option><option value="shared">みんなに共有</option></select></label>{selected && <small>作成：{selected.username}</small>}</div>
+          <div className="note-meta"><label>公開範囲 <select value={visibility} onChange={e => setVisibility(e.target.value as 'private' | 'shared')} disabled={busy || (!!selected && selected.owner_id !== user.id)}><option value="private">自分だけ・指定した人</option><option value="shared">みんなに共有</option></select></label>{selected && <small>作成：{selected.username}</small>}</div>
+          {selected && selected.owner_id === user.id && selected.visibility === 'private' && <div className="share-panel"><label htmlFor="share-names">特定のユーザーと共有</label><p>ユーザー名を入力してください。指定した人はこのノートを閲覧・編集できます。</p><div className="share-controls"><input id="share-names" value={shareNames} onChange={e => setShareNames(e.target.value)} placeholder="例：hanako, taro" disabled={busy || !shareLoaded} /><button type="button" className="secondary" onClick={updateShares} disabled={busy || !shareLoaded}>共有先を保存</button></div><small>複数人はカンマで区切ります。空欄で保存すると共有を解除します。</small></div>}
           <label className="sr-only" htmlFor="note-body">本文</label><textarea id="note-body" value={body} onChange={e => setBody(e.target.value)} maxLength={100000} placeholder="今日学んだこと、気づいたことを書いてみましょう…" disabled={busy} />
           <div className="editor-footer"><small>{body.length.toLocaleString()} 文字{selected && ` · 更新 ${date(selected.updated_at)}`}</small>{(!selected || selected.owner_id === user.id) && <button type="button" className="delete-button" onClick={remove} disabled={busy}>{selected ? 'ノートを削除' : '作成をやめる'}</button>}</div>
         </form>}</section></div>

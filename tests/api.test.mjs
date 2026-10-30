@@ -46,6 +46,25 @@ test('multi-user notebook API', async t => {
     assert.equal((await b.call(`notes/${personal.id}`,'PUT',{...personal,body:'intrusion'})).status,404);
     assert.equal((await b.call(`notes/${personal.id}?revision=1`,'DELETE')).status,404);
   });
+  await t.test('named sharing grants and revokes access only for selected users',async()=>{
+    const outsider=client();
+    assert.equal((await outsider.call('auth/register','POST',{...creds,username:`outside_${suffix}`})).status,201);
+    const peerName=`peer_${suffix}`;
+    assert.equal((await a.call(`notes/${personal.id}/shares`,'PUT',{usernames:[peerName]})).status,200);
+    assert((await b.call('notes')).data.notes.some(n=>n.id===personal.id));
+    assert.equal((await b.call(`notes/${personal.id}`)).status,200);
+    assert.equal((await outsider.call(`notes/${personal.id}`)).status,404);
+    assert.equal((await outsider.call(`notes/${personal.id}`,'PUT',{...personal,body:'intrusion'})).status,404);
+    assert.equal((await b.call(`notes/${personal.id}/shares`)).status,404);
+    assert.equal((await a.call(`notes/${personal.id}/shares`,'PUT',{usernames:[peerName,`missing_${suffix}`]})).status,400);
+    assert.deepEqual((await a.call(`notes/${personal.id}/shares`)).data.usernames,[peerName]);
+    const edit=await b.call(`notes/${personal.id}`,'PUT',{...personal,body:'招待された人の編集'});
+    assert.equal(edit.status,200); personal=edit.data.note;
+    assert.equal((await b.call(`notes/${personal.id}?revision=${personal.revision}`,'DELETE')).status,403);
+    assert.equal((await a.call(`notes/${personal.id}/shares`,'PUT',{usernames:[]})).status,200);
+    assert.equal((await b.call(`notes/${personal.id}`)).status,404);
+    assert.equal((await b.call(`notes/${personal.id}`,'PUT',{...personal,body:'revoked'})).status,404);
+  });
   await t.test('shared editing, owner-only visibility and deletion',async()=>{
     assert.equal((await b.call(`notes/${shared.id}`,'PUT',{...shared,visibility:'private'})).status,403);
     const r=await b.call(`notes/${shared.id}`,'PUT',{...shared,body:'仲間の追記'});
@@ -93,7 +112,7 @@ test('multi-user notebook API', async t => {
     assert.equal((await b.call(`notes/${note.id}`)).status,404);
   });
   await t.test('owner deletion and logout invalidate access',async()=>{
-    assert.equal((await a.call(`notes/${personal.id}?revision=1`,'DELETE')).status,200);
+    assert.equal((await a.call(`notes/${personal.id}?revision=${personal.revision}`,'DELETE')).status,200);
     assert.equal((await a.call(`notes/${personal.id}`)).status,404);
     const oldCookie=a.cookie;
     await a.call('auth/logout','POST'); a.cookie=oldCookie;

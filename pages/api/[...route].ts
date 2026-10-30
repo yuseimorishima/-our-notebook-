@@ -119,7 +119,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.json({ ok: true });
     }
     if (path === 'notes' && method === 'GET') {
-      const notes = await db.prepare(`${noteQuery} WHERE owner_id = ? OR visibility = 'shared' ORDER BY updated_at DESC, notes.id DESC`).all(user.id);
+      const notes = await db.prepare(`${noteQuery} WHERE owner_id = ? OR visibility = 'shared' OR EXISTS (SELECT 1 FROM note_shares WHERE note_id = notes.id AND user_id = ?) ORDER BY updated_at DESC, notes.id DESC`).all(user.id, user.id);
       return res.json({ notes });
     }
     if (path === 'notes' && method === 'POST') {
@@ -128,23 +128,63 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       const result = await db.prepare('INSERT INTO notes(owner_id, title, body, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(user.id, note.title, note.body, note.visibility, now, now);
       return res.status(201).json({ note: await db.prepare(`${noteQuery} WHERE notes.id = ?`).get(result.lastInsertRowid) });
     }
+    if (/^notes\/\d+\/shares$/.test(path)) {
+      const id = Number(path.split('/')[1]);
+      const ownerNote = await db.prepare('SELECT id, visibility FROM notes WHERE id = ? AND owner_id = ?').get(id, user.id) as {id:number;visibility:string} | undefined;
+      if (!ownerNote) fail(404, 'ノートが見つかりません。');
+      if (method === 'GET') {
+        const shares = await db.prepare('SELECT users.username FROM note_shares JOIN users ON users.id = note_shares.user_id WHERE note_id = ? ORDER BY users.username').all(id);
+        return res.json({ usernames: shares.map(row => row.username) });
+      }
+      if (method === 'PUT') {
+        if (ownerNote.visibility !== 'private') fail(400, '特定の人に共有するには、公開範囲を「自分だけ」にして保存してください。');
+        if (!Array.isArray(body.usernames) || body.usernames.length > 50 || !body.usernames.every((name: unknown) => typeof name === 'string' && /^[\p{L}\p{N}_-]{3,30}$/u.test(name.normalize('NFKC').trim().toLowerCase()))) fail(400, '共有先のユーザー名を確認してください。');
+        const names = [...new Set((body.usernames as string[]).map(name => name.normalize('NFKC').trim().toLowerCase()))];
+        if (names.includes(user.username)) fail(400, '自分のユーザー名は指定しなくて大丈夫です。');
+        const tx = await (await db.ready()).transaction('write');
+        try {
+          const current = await tx.execute({sql:'SELECT id FROM notes WHERE id = ? AND owner_id = ? AND visibility = ?',args:[id,user.id,'private']});
+          if (!current.rows.length) fail(409, 'ノートの設定が変更されました。再読み込みしてください。');
+          const recipients: number[] = [];
+          for (const name of names) {
+            const result = await tx.execute({sql:'SELECT id FROM users WHERE username = ? AND disabled = 0',args:[name]});
+            if (!result.rows.length) fail(400, `ユーザー「${name}」が見つかりません。`);
+            recipients.push(Number(result.rows[0].id));
+          }
+          await tx.execute({sql:'DELETE FROM note_shares WHERE note_id = ?',args:[id]});
+          for (const recipient of recipients) await tx.execute({sql:'INSERT INTO note_shares(note_id,user_id) VALUES (?,?)',args:[id,recipient]});
+          await tx.commit();
+        } catch (error) { await tx.rollback(); throw error; }
+        return res.json({usernames:names});
+      }
+    }
     if (/^notes\/\d+$/.test(path)) {
       const id = Number(path.split('/')[1]);
-      const note = await db.prepare(`${noteQuery} WHERE notes.id = ? AND (owner_id = ? OR visibility = 'shared')`).get(id, user.id) as Note | undefined;
+      const note = await db.prepare(`${noteQuery} WHERE notes.id = ? AND (owner_id = ? OR visibility = 'shared' OR EXISTS (SELECT 1 FROM note_shares WHERE note_id = notes.id AND user_id = ?))`).get(id, user.id, user.id) as Note | undefined;
       if (!note) fail(404, 'ノートが見つかりません。');
       if (method === 'GET') return res.json({ note });
       if (method === 'PUT') {
         const value = inputNote(body);
         if (note.owner_id !== user.id && value.visibility !== note.visibility) fail(403, '公開範囲を変更できるのは作成者だけです。');
         if (!Number.isInteger(body.revision)) fail(400, 'ノートのバージョンが必要です。');
-        const result = await db.prepare('UPDATE notes SET title = ?, body = ?, visibility = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?').run(value.title, value.body, value.visibility, new Date().toISOString(), id, body.revision);
-        if (!result.changes) fail(409, '他の人が更新しました。再読み込みして最新の内容を確認してください。入力内容はそのまま残っています。');
+        const tx = await (await db.ready()).transaction('write');
+        try {
+          const result = await tx.execute({sql:`UPDATE notes SET title = ?, body = ?, visibility = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ? AND (owner_id = ? OR (visibility = ? AND ? = ?) OR (visibility = ? AND ? = ? AND EXISTS (SELECT 1 FROM note_shares WHERE note_id = notes.id AND user_id = ?)))`,args:[value.title,value.body,value.visibility,new Date().toISOString(),id,body.revision,user.id,'shared',value.visibility,'shared','private',value.visibility,'private',user.id]});
+          if (!result.rowsAffected) fail(409, 'ノートが変更されたか、編集権限がなくなりました。再読み込みしてください。');
+          if (note.owner_id === user.id && value.visibility === 'shared') await tx.execute({sql:'DELETE FROM note_shares WHERE note_id = ?',args:[id]});
+          await tx.commit();
+        } catch (error) { await tx.rollback(); throw error; }
         return res.json({ note: await db.prepare(`${noteQuery} WHERE notes.id = ?`).get(id) });
       }
       if (method === 'DELETE') {
         if (note.owner_id !== user.id) fail(403, '削除できるのは作成者だけです。');
-        const result = await db.prepare('DELETE FROM notes WHERE id = ? AND revision = ?').run(id, Number(req.query.revision));
-        if (!result.changes) fail(409, 'ノートが更新されています。再読み込みしてください。');
+        const tx = await (await db.ready()).transaction('write');
+        try {
+          await tx.execute({sql:'DELETE FROM note_shares WHERE note_id = ?',args:[id]});
+          const result = await tx.execute({sql:'DELETE FROM notes WHERE id = ? AND owner_id = ? AND revision = ?',args:[id,user.id,Number(req.query.revision)]});
+          if (!result.rowsAffected) fail(409, 'ノートが更新されています。再読み込みしてください。');
+          await tx.commit();
+        } catch (error) { await tx.rollback(); throw error; }
         return res.json({ ok: true });
       }
     }
