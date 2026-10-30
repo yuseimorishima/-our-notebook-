@@ -99,7 +99,12 @@ export default function Home() {
     finally { setBusy(false); }
   }
   async function remove() {
-    if (!selected || !window.confirm(`「${selected.title}」を削除しますか？この操作は元に戻せません。`)) return;
+    if (!selected) {
+      if ((title || body) && !window.confirm('作成中のノートを破棄しますか？')) return;
+      setEditing(false); setTitle(''); setBody(''); setError(''); setNotice('作成中のノートを破棄しました');
+      return;
+    }
+    if (!window.confirm(`「${selected.title}」を削除しますか？この操作は元に戻せません。`)) return;
     setBusy(true); setError('');
     try {
       await api(`notes/${selected.id}?revision=${selected.revision}`, 'DELETE');
@@ -143,7 +148,7 @@ export default function Home() {
           <label className="sr-only" htmlFor="note-title">タイトル</label><input id="note-title" className="title-input" value={title} onChange={e => setTitle(e.target.value)} maxLength={120} placeholder="ノートのタイトル" required disabled={busy} />
           <div className="note-meta"><label>公開範囲 <select value={visibility} onChange={e => setVisibility(e.target.value as 'private' | 'shared')} disabled={busy || (!!selected && selected.owner_id !== user.id)}><option value="private">自分だけ</option><option value="shared">みんなに共有</option></select></label>{selected && <small>作成：{selected.username}</small>}</div>
           <label className="sr-only" htmlFor="note-body">本文</label><textarea id="note-body" value={body} onChange={e => setBody(e.target.value)} maxLength={100000} placeholder="今日学んだこと、気づいたことを書いてみましょう…" disabled={busy} />
-          <div className="editor-footer"><small>{body.length.toLocaleString()} 文字{selected && ` · 更新 ${date(selected.updated_at)}`}</small>{selected?.owner_id === user.id && <button type="button" className="delete-button" onClick={remove} disabled={busy}>ノートを削除</button>}</div>
+          <div className="editor-footer"><small>{body.length.toLocaleString()} 文字{selected && ` · 更新 ${date(selected.updated_at)}`}</small>{(!selected || selected.owner_id === user.id) && <button type="button" className="delete-button" onClick={remove} disabled={busy}>{selected ? 'ノートを削除' : '作成をやめる'}</button>}</div>
         </form>}</section></div>
       </main>
     </div>}
